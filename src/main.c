@@ -27,6 +27,8 @@
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <wlr/xwayland.h>
+
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -85,6 +87,13 @@ struct tinywl_toplevel {
   struct tinywl_server *server;
   struct wlr_xdg_toplevel *xdg_toplevel;
   struct wlr_scene_tree *scene_tree;
+
+  /* We need these for borders*/
+  struct wlr_scene_rect *border_top;
+  struct wlr_scene_rect *border_bottom;
+  struct wlr_scene_rect *border_left;
+  struct wlr_scene_rect *border_right;
+
   struct wl_listener map;
   struct wl_listener unmap;
   struct wl_listener commit;
@@ -136,6 +145,7 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
       wlr_xdg_toplevel_set_activated(prev_toplevel, false);
     }
   }
+
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   /* Move the toplevel to the front */
   wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
@@ -179,6 +189,47 @@ static void execute_program(char *name) {
   }
 }
 
+static void close_focused_surface(struct tinywl_server *server) {
+  struct wlr_surface *focused_surface =
+      server->seat->keyboard_state.focused_surface;
+  // STUDY THIS BIT MORE, IMPORTANT
+  // WE FIND WHAT HAS KEYBOARD FOCUS AND SEND KILL SIGNAL TO IT.
+  if (focused_surface) {
+    struct wl_client *client =
+        wl_resource_get_client(focused_surface->resource);
+    pid_t pid;
+    wl_client_get_credentials(client, &pid, NULL, NULL);
+    wlr_log(WLR_INFO, "Keyboard-focused window PID: %d", pid);
+    kill(pid, SIGTERM);
+  }
+}
+
+static void cycle_toplevel(struct tinywl_server *server) {
+  if (wl_list_length(&server->toplevels) < 2) {
+    return;
+  }
+  struct tinywl_toplevel *next_toplevel =
+      wl_container_of(server->toplevels.prev, next_toplevel, link);
+  focus_toplevel(next_toplevel);
+}
+
+typedef struct {
+  xkb_keysym_t key;
+  void (*fptr)(struct tinywl_server *server);
+} compositor_binding;
+
+typedef struct {
+  xkb_keysym_t key;
+  char *command;
+} user_binding;
+
+void terminate_display(struct tinywl_server *server) {
+  wl_display_terminate(server->wl_display);
+}
+
+/* User would set this to any of the modifier keys per their preference */
+#define MODKEY WLR_MODIFIER_ALT
+
 static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
   /*
    * Here we handle compositor keybindings. This is when the compositor is
@@ -187,58 +238,47 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
    *
    * This function assumes Alt is held down.
    */
-  switch (sym) {
-  case XKB_KEY_Escape:
-    wl_display_terminate(server->wl_display);
-    break;
-  case XKB_KEY_F1:
-    /* Cycle to the next toplevel */
-    if (wl_list_length(&server->toplevels) < 2) {
+  static const compositor_binding c_bindings[3] = {
+      {XKB_KEY_Escape, terminate_display},
+      {XKB_KEY_F1, cycle_toplevel},
+      {XKB_KEY_q, close_focused_surface}};
+
+  static const user_binding bindings[14] = {
+      {XKB_KEY_Return, "kitty"},
+      {XKB_KEY_F, "firefox"},
+      {XKB_KEY_e, "kitty ranger"},
+      {XKB_KEY_v, "pavucontrol"},
+      {XKB_KEY_r, "rofi -show drun"},
+      {XKB_KEY_c, "kitty qalc"},
+      {XKB_KEY_XF86MonBrightnessUp, "light -A 10"},
+      {XKB_KEY_XF86MonBrightnessDown, "light -U 10"},
+      {XKB_KEY_XF86AudioPrev, "playerctl previous"},
+      {XKB_KEY_XF86AudioNext, "playerctl next"},
+      {XKB_KEY_XF86AudioPlay, "playerctl play_pause"},
+      {XKB_KEY_XF86AudioRaiseVolume,
+       "pactl set-sink-volume @DEFAULT_SINK@ +10%"},
+      {XKB_KEY_XF86AudioLowerVolume,
+       "pactl set-sink-volume @DEFAULT_SINK@ -10%"},
+      {XKB_KEY_XF86AudioMute, "pactl set-sink-mute @DEFAULT_SINK@ toggle"}};
+
+  bool match_found = false;
+  for (unsigned int i = 0; i < 5; i++) {
+    if (bindings[i].key == sym) {
+      match_found = true;
+      execute_program(bindings[i].command);
       break;
     }
-    struct tinywl_toplevel *next_toplevel =
-        wl_container_of(server->toplevels.prev, next_toplevel, link);
-    focus_toplevel(next_toplevel);
-    break;
-  case XKB_KEY_Return:
-    execute_program("kitty");
-    break;
-  case XKB_KEY_F:
-    execute_program("firefox");
-    break;
-  case XKB_KEY_E:
-    execute_program("thunar");
-    break;
-  case XKB_KEY_e:
-    execute_program("kitty ranger");
-    break;
-  case XKB_KEY_v:
-    execute_program("pavucontrol");
-    break;
-  case XKB_KEY_r:
-    execute_program("rofi -show drun");
-    break;
-  case XKB_KEY_q:
-    struct wlr_surface *focused_surface =
-        server->seat->keyboard_state.focused_surface;
-    // STUDY THIS BIT MORE, IMPORTANT
-    // WE FIND WHAT HAS KEYBOARD FOCUS AND SEND KILL SIGNAL TO IT.
-    if (focused_surface) {
-      struct wl_client *client =
-          wl_resource_get_client(focused_surface->resource);
-      pid_t pid;
-      wl_client_get_credentials(client, &pid, NULL, NULL);
-      wlr_log(WLR_INFO, "Keyboard-focused window PID: %d", pid);
-      kill(pid, SIGTERM);
-    }
-    break;
-  case XKB_KEY_w:
-    execute_program("swaybg -i /home/noodle/MEGA/Images/Wallpapers/insomnium.png -m fill");
-    break;
-  default:
-    return false;
   }
-  return true;
+
+  for (unsigned int i = 0; i < 3; i++) {
+    if (c_bindings[i].key == sym) {
+      match_found = true;
+      c_bindings[i].fptr(server);
+      break;
+    }
+  }
+
+  return match_found;
 }
 
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
@@ -257,8 +297,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
   bool handled = false;
   uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-  if ((modifiers & WLR_MODIFIER_LOGO) &&
-      event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+  if ((modifiers & MODKEY) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
     /* If alt is held down and this button was _pressed_, we attempt to
      * process it as a compositor keybinding. */
     for (int i = 0; i < nsyms; i++) {
@@ -734,6 +773,26 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
      * dimensions itself. */
     wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
   }
+
+  // Update border dimensions based on surface size
+  struct wlr_box *geo_box = &toplevel->xdg_toplevel->base->geometry;
+  int border_width = 2;
+
+  wlr_scene_rect_set_size(toplevel->border_top, geo_box->width, border_width);
+  wlr_scene_rect_set_size(toplevel->border_bottom, geo_box->width,
+                          border_width);
+  wlr_scene_rect_set_size(toplevel->border_left, border_width, geo_box->height);
+  wlr_scene_rect_set_size(toplevel->border_right, border_width,
+                          geo_box->height);
+
+  wlr_scene_node_set_position(&toplevel->border_top->node, geo_box->x,
+                              geo_box->y - border_width);
+  wlr_scene_node_set_position(&toplevel->border_bottom->node, geo_box->x,
+                              geo_box->y + geo_box->height);
+  wlr_scene_node_set_position(&toplevel->border_left->node,
+                              geo_box->x - border_width, geo_box->y);
+  wlr_scene_node_set_position(&toplevel->border_right->node,
+                              geo_box->x + geo_box->width, geo_box->y);
 }
 
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
@@ -850,6 +909,24 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
       &toplevel->server->scene->tree, xdg_toplevel->base);
   toplevel->scene_tree->node.data = toplevel;
   xdg_toplevel->base->data = toplevel->scene_tree;
+
+  // Create borders
+  int border_width = 2;
+  float border_color[4] = {1.0f, 0.647f, 0.0f, 1.0f};
+  
+  /* This is currently borked for lutris */
+  toplevel->border_top = wlr_scene_rect_create(toplevel->scene_tree, 0,
+                                               border_width, border_color);
+  toplevel->border_bottom = wlr_scene_rect_create(toplevel->scene_tree, 0,
+                                                  border_width, border_color);
+  toplevel->border_left = wlr_scene_rect_create(toplevel->scene_tree,
+                                                border_width, 0, border_color);
+  toplevel->border_right = wlr_scene_rect_create(toplevel->scene_tree,
+                                                 border_width, 0, border_color);
+
+  // Position borders (they'll be updated on commit)
+  wlr_scene_node_set_position(&toplevel->border_top->node, 0, -border_width);
+  wlr_scene_node_set_position(&toplevel->border_left->node, -border_width, 0);
 
   /* Listen to the various events it can emit */
   toplevel->map.notify = xdg_toplevel_map;
@@ -1108,6 +1185,12 @@ int main(int argc, char *argv[]) {
    * loop configuration to listen to libinput events, DRM events, generate
    * frame events at the refresh rate, and so on. */
   wlr_log(WLR_INFO, "Running Wayland compositor on WAYLAND_DISPLAY=%s", socket);
+
+  /*
+   * We've wired in xwayland to ensure it will start, but we will still need to
+   * write client handling
+   */
+  wlr_xwayland_create(server.wl_display, compositor, false);
 
   wl_display_run(server.wl_display);
 
